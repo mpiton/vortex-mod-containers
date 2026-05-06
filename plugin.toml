@@ -1,0 +1,16 @@
+[plugin]
+name = "vortex-mod-containers"
+version = "1.0.0"
+category = "container"
+author = "vortex-community"
+description = "Decrypt link containers (DLC, CCF, RSDF) and parse Metalink (RFC 5854). Pure transformation, no network capability required."
+license = "GPL-3.0"
+min_vortex_version = "0.1.0"
+
+[capabilities]
+# The container plugin is purely pure: it consumes bytes (the dropped file)
+# and emits a list of links. No HTTP, no subprocess, no credentials. This
+# keeps the trust boundary tight — containers are dispatched into the Link
+# Grabber pipeline, which then calls the appropriate hoster plugin for the
+# actual download.
+http = false
