@@ -15,12 +15,20 @@
 Instead, please report them via one of these methods:
 
 1. **GitHub Security Advisories**: Use the [Security Advisory](https://github.com/mpiton/vortex-mod-containers/security/advisories/new) feature
-2. **Email**: Send details to `security@mpiton.dev`
+2. **Email**: Send details to `matpiton@protonmail.com`
+
+### Scope
+
+Security-sensitive areas in this plugin:
+
+- **Crypto** (`src/crypto.rs`): AES-128-CBC primitives. Bugs that allow plaintext recovery without the embedded key, or that cause buffer over-reads on malformed input, are in-scope.
+- **Format parsers** (`src/{dlc,ccf,rsdf,metalink}.rs`): Malformed container blobs that trigger panics, infinite loops, or DoS-grade memory growth.
+- **Trust boundary**: This plugin declares `http = false`. A change that re-enables outbound network calls without an explicit ADR + `plugin.toml` capability bump is a security regression.
 
 ### What to Include
 
 - Type of vulnerability
-- Steps to reproduce
+- Steps to reproduce (a minimal container blob is ideal)
 - Impact assessment
 - Suggested fix (if any)
 

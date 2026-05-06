@@ -37,19 +37,42 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `chore`, `ci`
 
 ### Development Setup
 
-<!-- TODO: Add project-specific setup instructions -->
-
 ```bash
 # Clone the repo
 git clone https://github.com/mpiton/vortex-mod-containers.git
 cd vortex-mod-containers
 
-# Install dependencies
-# TODO: Add install commands
+# Install the WASM target (one-time)
+rustup target add wasm32-wasip1
 
-# Run tests
-# TODO: Add test commands
+# Run native tests (fast, ~1s)
+cargo test
+
+# Lint + format
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+
+# Build the WASM artefact
+cargo build --target wasm32-wasip1 --release
+# Output: target/wasm32-wasip1/release/vortex_mod_containers.wasm
+sha256sum target/wasm32-wasip1/release/vortex_mod_containers.wasm
 ```
+
+### Adding a new container format
+
+1. Add the format module in `src/<format>.rs` with `looks_like_*`, `decode`, and (for testing) `encode` helpers.
+2. Wire it through `src/dispatch.rs::detect` and `src/lib.rs::decrypt`.
+3. Add 5+ unit tests in the module covering: round-trip, magic detection, malformed input, empty input.
+4. Add 5 fixtures in `tests/synthetic_corpus.rs` so the integration suite stays at ≥20 containers.
+5. Update `docs/ADR-001-container-keys.md` if the format introduces new key material or trust assumptions.
+
+### Coding standards
+
+- No `.unwrap()` outside tests — return `Result<_, PluginError>` and propagate via `?`.
+- No `unsafe` without an ADR justifying it.
+- No `#[allow(dead_code)]` or `#[allow(unused)]` — remove the dead code instead.
+- The plugin must not gain new capabilities (`http`, `subprocess`, `get_credential`) without an ADR documenting the trust trade-off.
+- WASM artefact must stay under 500 KB.
 
 ## Code of Conduct
 
