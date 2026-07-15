@@ -129,6 +129,8 @@ struct ParseState {
     current_file: Option<FileBuilder>,
     text_target: Option<TextTarget>,
     text_buffer: String,
+    element_text_bytes: Vec<usize>,
+    outside_text_bytes: usize,
     current_hash_algo: Option<ChecksumAlgo>,
     files: Vec<ContainerLink>,
 }
@@ -150,6 +152,7 @@ struct FileBuilder {
 
 impl ParseState {
     fn on_start(&mut self, e: BytesStart<'_>) -> Result<(), PluginError> {
+        self.element_text_bytes.push(0);
         let local = local_name(e.name().as_ref());
         match local.as_str() {
             "file" => {
@@ -181,7 +184,18 @@ impl ParseState {
     }
 
     fn append_text(&mut self, text: &str) -> Result<(), PluginError> {
-        ensure_within_limit(text.len(), MAX_TEXT_BYTES, "text bytes")?;
+        let accumulated = self
+            .element_text_bytes
+            .last()
+            .copied()
+            .unwrap_or(self.outside_text_bytes)
+            .saturating_add(text.len());
+        ensure_within_limit(accumulated, MAX_TEXT_BYTES, "text bytes")?;
+        if let Some(element_text_bytes) = self.element_text_bytes.last_mut() {
+            *element_text_bytes = accumulated;
+        } else {
+            self.outside_text_bytes = accumulated;
+        }
         if self.text_target.is_some() {
             ensure_within_limit(
                 self.text_buffer.len().saturating_add(text.len()),
@@ -223,6 +237,7 @@ impl ParseState {
     }
 
     fn on_end(&mut self, name: &[u8]) -> Result<(), PluginError> {
+        self.element_text_bytes.pop();
         let local = local_name(name);
         match local.as_str() {
             "file" => {
@@ -510,6 +525,24 @@ mod tests {
     fn decode_rejects_oversized_text_split_across_references() {
         let references = "&amp;".repeat(MAX_TEXT_BYTES + 1);
         let xml = format!("<metalink><file><url>{references}</url></file></metalink>");
+
+        let err = decode(xml.as_bytes()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PluginError::LimitExceeded {
+                resource: "text bytes",
+                limit: 65_536
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_ignored_text_split_across_references() {
+        let references = "&amp;".repeat(MAX_TEXT_BYTES + 1);
+        let xml = format!(
+            "<metalink><ignored>{references}</ignored><file><url>https://example.com/file.bin</url></file></metalink>"
+        );
 
         let err = decode(xml.as_bytes()).unwrap_err();
 
