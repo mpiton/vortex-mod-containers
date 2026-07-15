@@ -142,7 +142,7 @@ fn parse_inner(xml: &str) -> Result<Vec<ContainerLink>, PluginError> {
                             let plain = B64.decode(trimmed)?;
                             file.url = Some(String::from_utf8(plain)?);
                         }
-                        (Some(InnerField::Filename), Some(file)) => {
+                        (Some(InnerField::Filename), Some(file)) if !trimmed.is_empty() => {
                             let plain = B64.decode(trimmed)?;
                             file.filename = Some(String::from_utf8(plain)?);
                         }
@@ -320,5 +320,13 @@ mod tests {
         let container = encode(&entries).unwrap();
         let links = decode(container.as_bytes()).unwrap();
         assert_eq!(links[0].filename.as_deref(), Some("éàü 文档.zip"));
+    }
+
+    #[test]
+    fn decode_omits_empty_filename() {
+        let container = encode(&[("https://example.com/x", Some(""), None)]).unwrap();
+        let links = decode(container.as_bytes()).unwrap();
+
+        assert_eq!(links[0].filename.as_deref(), None);
     }
 }

@@ -49,7 +49,14 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<ContainerLink>, PluginError> {
     let mut elements = 0;
     loop {
         match reader.read_event_into(&mut buf)? {
-            Event::Eof => break,
+            Event::Eof => {
+                if depth != 0 {
+                    return Err(PluginError::Xml(
+                        "unexpected EOF with unclosed XML elements".into(),
+                    ));
+                }
+                break;
+            }
             Event::Start(e) => {
                 count_element(&mut elements)?;
                 depth += 1;
@@ -174,6 +181,7 @@ impl ParseState {
     }
 
     fn append_text(&mut self, text: &str) -> Result<(), PluginError> {
+        ensure_within_limit(text.len(), MAX_TEXT_BYTES, "text bytes")?;
         if self.text_target.is_some() {
             ensure_within_limit(
                 self.text_buffer.len().saturating_add(text.len()),
@@ -481,6 +489,24 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_oversized_text_in_unrecognized_element() {
+        let ignored = "a".repeat(MAX_TEXT_BYTES + 1);
+        let xml = format!(
+            "<metalink><ignored>{ignored}</ignored><file><url>https://example.com/file.bin</url></file></metalink>"
+        );
+
+        let err = decode(xml.as_bytes()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PluginError::LimitExceeded {
+                resource: "text bytes",
+                limit: 65_536
+            }
+        ));
+    }
+
+    #[test]
     fn decode_rejects_oversized_text_split_across_references() {
         let references = "&amp;".repeat(MAX_TEXT_BYTES + 1);
         let xml = format!("<metalink><file><url>{references}</url></file></metalink>");
@@ -499,6 +525,14 @@ mod tests {
     #[test]
     fn decode_reports_malformed_xml_as_typed_error() {
         let err = decode(b"<metalink><file></metalink>").unwrap_err();
+
+        assert!(matches!(err, PluginError::Xml(_)));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_document_after_complete_file() {
+        let err =
+            decode(b"<metalink><file><url>https://example.com/file.bin</url></file>").unwrap_err();
 
         assert!(matches!(err, PluginError::Xml(_)));
     }
