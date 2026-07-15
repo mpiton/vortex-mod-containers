@@ -22,6 +22,7 @@ use quick_xml::Reader;
 use crate::crypto::{aes128_cbc_decrypt, aes128_cbc_encrypt};
 use crate::error::PluginError;
 use crate::types::ContainerLink;
+use crate::xml::{decode_reference, decode_text};
 
 pub const CCF_MAGIC: &str = "CCF1\n";
 pub const CCF_KEY: [u8; 16] = *b"v0rt3xCryptL0adC";
@@ -51,15 +52,25 @@ fn parse_inner(xml: &str) -> Result<Vec<ContainerLink>, PluginError> {
     let mut links = Vec::new();
     let mut current: Option<InnerFile> = None;
     let mut active: Option<Field> = None;
+    let mut field_text = String::new();
 
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Eof => break,
             Event::Start(e) => match e.name().as_ref() {
                 b"file" => current = Some(InnerFile::default()),
-                b"url" => active = Some(Field::Url),
-                b"name" => active = Some(Field::Name),
-                b"size" => active = Some(Field::Size),
+                b"url" => {
+                    active = Some(Field::Url);
+                    field_text.clear();
+                }
+                b"name" => {
+                    active = Some(Field::Name);
+                    field_text.clear();
+                }
+                b"size" => {
+                    active = Some(Field::Size);
+                    field_text.clear();
+                }
                 _ => {}
             },
             Event::End(e) => match e.name().as_ref() {
@@ -68,21 +79,25 @@ fn parse_inner(xml: &str) -> Result<Vec<ContainerLink>, PluginError> {
                         links.push(f.finalise()?);
                     }
                 }
-                b"url" | b"name" | b"size" => active = None,
+                b"url" | b"name" | b"size" => {
+                    if let Some(file) = current.as_mut() {
+                        let trimmed = field_text.trim();
+                        match active {
+                            Some(Field::Url) => file.url = Some(trimmed.to_string()),
+                            Some(Field::Name) => file.name = Some(trimmed.to_string()),
+                            Some(Field::Size) => file.size = trimmed.parse::<u64>().ok(),
+                            None => {}
+                        }
+                    }
+                    active = None;
+                    field_text.clear();
+                }
                 _ => {}
             },
-            Event::Text(t) => {
-                let owned = t.unescape()?.into_owned();
-                let trimmed = owned.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                match (active, current.as_mut()) {
-                    (Some(Field::Url), Some(f)) => f.url = Some(trimmed.to_string()),
-                    (Some(Field::Name), Some(f)) => f.name = Some(trimmed.to_string()),
-                    (Some(Field::Size), Some(f)) => f.size = trimmed.parse::<u64>().ok(),
-                    _ => {}
-                }
+            Event::Text(t) if active.is_some() => field_text.push_str(&decode_text(&t)?),
+            Event::CData(c) if active.is_some() => field_text.push_str(&c.decode()?),
+            Event::GeneralRef(reference) if active.is_some() => {
+                field_text.push_str(&decode_reference(&reference)?)
             }
             _ => {}
         }
@@ -104,7 +119,10 @@ struct InnerFile {
 
 impl InnerFile {
     fn finalise(self) -> Result<ContainerLink, PluginError> {
-        let url = self.url.ok_or(PluginError::MissingField("url"))?;
+        let url = self
+            .url
+            .filter(|url| !url.trim().is_empty())
+            .ok_or(PluginError::MissingField("url"))?;
         Ok(ContainerLink {
             url,
             filename: self.name,
@@ -213,6 +231,15 @@ mod tests {
         blob.extend_from_slice(B64.encode(&cipher).as_bytes());
         let err = decode(&blob).unwrap_err();
         assert!(matches!(err, PluginError::Malformed(_)));
+    }
+
+    #[test]
+    fn decode_rejects_empty_url() {
+        let blob = encode(&[("", None, None)]).unwrap();
+
+        let err = decode(&blob).unwrap_err();
+
+        assert!(matches!(err, PluginError::MissingField("url")));
     }
 
     #[test]

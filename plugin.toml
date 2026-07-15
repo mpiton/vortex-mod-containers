@@ -1,6 +1,6 @@
 [plugin]
 name = "vortex-mod-containers"
-version = "1.0.0"
+version = "1.0.1"
 category = "container"
 author = "vortex-community"
 description = "Decrypt link containers (DLC, CCF, RSDF) and parse Metalink (RFC 5854). Pure transformation, no network capability required."

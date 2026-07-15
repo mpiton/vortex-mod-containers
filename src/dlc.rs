@@ -29,6 +29,7 @@ use quick_xml::Reader;
 use crate::crypto::{aes128_cbc_decrypt, aes128_cbc_encrypt};
 use crate::error::PluginError;
 use crate::types::ContainerLink;
+use crate::xml::{decode_reference, decode_text};
 
 /// Historic DLC v1 key (JDownloader, public).
 pub const DLC_KEY: [u8; 16] = *b"cb99b5cbc24db398";
@@ -82,9 +83,12 @@ fn extract_content(xml: &str) -> Result<String, PluginError> {
             Event::Eof => break,
             Event::Start(e) if e.name().as_ref() == b"content" => in_content = true,
             Event::End(e) if e.name().as_ref() == b"content" => in_content = false,
-            Event::Text(t) if in_content => text.push_str(&t.unescape()?),
+            Event::Text(t) if in_content => text.push_str(&decode_text(&t)?),
             Event::CData(c) if in_content => {
                 text.push_str(std::str::from_utf8(c.into_inner().as_ref())?)
+            }
+            Event::GeneralRef(reference) if in_content => {
+                text.push_str(&decode_reference(&reference)?)
             }
             _ => {}
         }
@@ -104,15 +108,25 @@ fn parse_inner(xml: &str) -> Result<Vec<ContainerLink>, PluginError> {
     let mut links = Vec::new();
     let mut current: Option<InnerFile> = None;
     let mut active_field: Option<InnerField> = None;
+    let mut field_text = String::new();
 
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Eof => break,
             Event::Start(e) => match e.name().as_ref() {
                 b"file" => current = Some(InnerFile::default()),
-                b"url" => active_field = Some(InnerField::Url),
-                b"filename" => active_field = Some(InnerField::Filename),
-                b"size" => active_field = Some(InnerField::Size),
+                b"url" => {
+                    active_field = Some(InnerField::Url);
+                    field_text.clear();
+                }
+                b"filename" => {
+                    active_field = Some(InnerField::Filename);
+                    field_text.clear();
+                }
+                b"size" => {
+                    active_field = Some(InnerField::Size);
+                    field_text.clear();
+                }
                 _ => {}
             },
             Event::End(e) => match e.name().as_ref() {
@@ -121,27 +135,31 @@ fn parse_inner(xml: &str) -> Result<Vec<ContainerLink>, PluginError> {
                         links.push(file.finalise()?);
                     }
                 }
-                b"url" | b"filename" | b"size" => active_field = None,
+                b"url" | b"filename" | b"size" => {
+                    let trimmed = field_text.trim();
+                    match (active_field, current.as_mut()) {
+                        (Some(InnerField::Url), Some(file)) => {
+                            let plain = B64.decode(trimmed)?;
+                            file.url = Some(String::from_utf8(plain)?);
+                        }
+                        (Some(InnerField::Filename), Some(file)) => {
+                            let plain = B64.decode(trimmed)?;
+                            file.filename = Some(String::from_utf8(plain)?);
+                        }
+                        (Some(InnerField::Size), Some(file)) => {
+                            file.size = trimmed.parse::<u64>().ok();
+                        }
+                        _ => {}
+                    }
+                    active_field = None;
+                    field_text.clear();
+                }
                 _ => {}
             },
-            Event::Text(t) => {
-                let trimmed = t.unescape()?.into_owned();
-                let trimmed = trimmed.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                match (active_field, current.as_mut()) {
-                    (Some(InnerField::Url), Some(f)) => {
-                        let plain = B64.decode(&trimmed)?;
-                        f.url = Some(String::from_utf8(plain)?);
-                    }
-                    (Some(InnerField::Filename), Some(f)) => {
-                        let plain = B64.decode(&trimmed)?;
-                        f.filename = Some(String::from_utf8(plain)?);
-                    }
-                    (Some(InnerField::Size), Some(f)) => f.size = trimmed.parse::<u64>().ok(),
-                    _ => {}
-                }
+            Event::Text(t) if active_field.is_some() => field_text.push_str(&decode_text(&t)?),
+            Event::CData(c) if active_field.is_some() => field_text.push_str(&c.decode()?),
+            Event::GeneralRef(reference) if active_field.is_some() => {
+                field_text.push_str(&decode_reference(&reference)?)
             }
             _ => {}
         }
@@ -163,7 +181,10 @@ struct InnerFile {
 
 impl InnerFile {
     fn finalise(self) -> Result<ContainerLink, PluginError> {
-        let url = self.url.ok_or(PluginError::MissingField("url"))?;
+        let url = self
+            .url
+            .filter(|url| !url.trim().is_empty())
+            .ok_or(PluginError::MissingField("url"))?;
         Ok(ContainerLink {
             url,
             filename: self.filename,
@@ -236,6 +257,15 @@ mod tests {
         assert_eq!(links[1].url, "https://hoster.example/file2.bin");
         assert!(links[1].filename.is_none());
         assert!(links[1].size_bytes.is_none());
+    }
+
+    #[test]
+    fn decode_rejects_empty_url() {
+        let container = encode(&[("", None, None)]).unwrap();
+
+        let err = decode(container.as_bytes()).unwrap_err();
+
+        assert!(matches!(err, PluginError::MissingField("url")));
     }
 
     #[test]

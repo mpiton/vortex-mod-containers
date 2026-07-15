@@ -16,6 +16,12 @@ pub enum PluginError {
     #[error("XML parse error: {0}")]
     Xml(String),
 
+    #[error("resource limit exceeded for {resource} (maximum {limit})")]
+    LimitExceeded {
+        resource: &'static str,
+        limit: usize,
+    },
+
     #[error("base64 decode error: {0}")]
     Base64(String),
 
@@ -61,6 +67,18 @@ impl From<quick_xml::Error> for PluginError {
 
 impl From<quick_xml::events::attributes::AttrError> for PluginError {
     fn from(e: quick_xml::events::attributes::AttrError) -> Self {
+        Self::Xml(e.to_string())
+    }
+}
+
+impl From<quick_xml::encoding::EncodingError> for PluginError {
+    fn from(e: quick_xml::encoding::EncodingError) -> Self {
+        Self::Xml(e.to_string())
+    }
+}
+
+impl From<quick_xml::escape::EscapeError> for PluginError {
+    fn from(e: quick_xml::escape::EscapeError) -> Self {
         Self::Xml(e.to_string())
     }
 }
