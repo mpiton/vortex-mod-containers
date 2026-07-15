@@ -46,7 +46,6 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<ContainerLink>, PluginError> {
 
 fn parse_inner(xml: &str) -> Result<Vec<ContainerLink>, PluginError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
 
     let mut links = Vec::new();
@@ -195,6 +194,15 @@ mod tests {
         assert_eq!(links[0].filename.as_deref(), Some("archive.rar"));
         assert_eq!(links[0].size_bytes, Some(2_000_000));
         assert_eq!(links[1].url, "https://cryptload.example/b.rar");
+    }
+
+    #[test]
+    fn parse_inner_preserves_spaces_around_entity_references() {
+        let xml = r#"<package><file><url>https://example.com/file</url><name>Rock &amp; Roll.zip</name></file></package>"#;
+
+        let links = parse_inner(xml).unwrap();
+
+        assert_eq!(links[0].filename.as_deref(), Some("Rock & Roll.zip"));
     }
 
     #[test]

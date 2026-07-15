@@ -34,8 +34,8 @@ pipeline.
 
 Metalink is treated as untrusted XML. Parsing rejects inputs above 1 MiB,
 nesting deeper than 64 elements, more than 50,000 elements, more than 64
-attributes on one element, or text nodes above 64 KiB. Limit violations and
-malformed XML return typed plugin errors without partial output.
+attributes on one element, or parsed field text above 64 KiB. Limit violations
+and malformed XML return typed plugin errors without partial output.
 
 ## Build
 
