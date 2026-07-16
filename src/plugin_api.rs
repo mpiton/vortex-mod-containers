@@ -21,13 +21,13 @@ pub fn can_decrypt(input: Vec<u8>) -> FnResult<String> {
 #[plugin_fn]
 pub fn detect(input: Vec<u8>) -> FnResult<String> {
     let resp = crate::detect(&input);
-    Ok(serde_json::to_string(&resp).map_err(json_err)?)
+    serde_json::to_string(&resp).map_err(json_err)
 }
 
 #[plugin_fn]
 pub fn decrypt(input: Vec<u8>) -> FnResult<String> {
     let resp = crate::decrypt(&input).map_err(plugin_err)?;
-    Ok(serde_json::to_string(&resp).map_err(json_err)?)
+    serde_json::to_string(&resp).map_err(json_err)
 }
 
 fn plugin_err(e: PluginError) -> WithReturnCode<Error> {

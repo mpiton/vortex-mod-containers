@@ -29,6 +29,7 @@ pub mod error;
 pub mod metalink;
 pub mod rsdf;
 pub mod types;
+mod xml;
 
 #[cfg(target_family = "wasm")]
 mod plugin_api;

@@ -6,13 +6,19 @@
 //! and v4 elements (`<url>` directly under `<file>`), as well as either case
 //! of the hash type attribute (`sha-256`, `SHA256`, etc.).
 
-use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 
 use crate::error::PluginError;
 use crate::types::{Checksum, ChecksumAlgo, ContainerLink};
+use crate::xml::{decode_reference, decode_text};
 
 const MAGIC_HINTS: &[&str] = &["<metalink", "<Metalink", "<METALINK"];
+const MAX_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_XML_DEPTH: usize = 64;
+const MAX_XML_ELEMENTS: usize = 50_000;
+const MAX_ATTRIBUTES_PER_ELEMENT: usize = 64;
+const MAX_TEXT_BYTES: usize = 64 * 1024;
 
 pub fn looks_like_metalink(bytes: &[u8]) -> bool {
     let head_len = bytes.len().min(4096);
@@ -32,23 +38,52 @@ pub fn looks_like_metalink(bytes: &[u8]) -> bool {
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Vec<ContainerLink>, PluginError> {
+    ensure_within_limit(bytes.len(), MAX_INPUT_BYTES, "input bytes")?;
     let xml = std::str::from_utf8(bytes)?;
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
     let mut state = ParseState::default();
     let mut buf = Vec::new();
+    let mut depth = 0;
+    let mut elements = 0;
     loop {
         match reader.read_event_into(&mut buf)? {
-            Event::Eof => break,
-            Event::Start(e) => state.on_start(e)?,
+            Event::Eof => {
+                if depth != 0 {
+                    return Err(PluginError::Xml(
+                        "unexpected EOF with unclosed XML elements".into(),
+                    ));
+                }
+                break;
+            }
+            Event::Start(e) => {
+                count_element(&mut elements)?;
+                depth += 1;
+                ensure_within_limit(depth, MAX_XML_DEPTH, "XML depth")?;
+                validate_attributes(&e)?;
+                state.on_start(e)?;
+            }
             Event::Empty(e) => {
+                count_element(&mut elements)?;
+                ensure_within_limit(depth + 1, MAX_XML_DEPTH, "XML depth")?;
+                validate_attributes(&e)?;
                 state.on_start(e.clone())?;
                 state.on_end(e.name().as_ref())?;
             }
-            Event::Text(t) => state.on_text(t.unescape()?.into_owned()),
-            Event::CData(c) => state.on_text(String::from_utf8(c.into_inner().into_owned())?),
-            Event::End(e) => state.on_end(e.name().as_ref())?,
+            Event::Text(t) => {
+                state.append_text(&decode_text(&t)?)?;
+            }
+            Event::CData(c) => {
+                state.append_text(&c.decode()?)?;
+            }
+            Event::GeneralRef(reference) => {
+                state.append_text(&decode_reference(&reference)?)?;
+            }
+            Event::End(e) => {
+                state.on_end(e.name().as_ref())?;
+                depth = depth.saturating_sub(1);
+            }
             _ => {}
         }
         buf.clear();
@@ -59,11 +94,43 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<ContainerLink>, PluginError> {
     Ok(state.files)
 }
 
+fn ensure_within_limit(
+    value: usize,
+    limit: usize,
+    resource: &'static str,
+) -> Result<(), PluginError> {
+    if value > limit {
+        return Err(PluginError::LimitExceeded { resource, limit });
+    }
+    Ok(())
+}
+
+fn count_element(elements: &mut usize) -> Result<(), PluginError> {
+    *elements += 1;
+    ensure_within_limit(*elements, MAX_XML_ELEMENTS, "XML elements")
+}
+
+fn validate_attributes(element: &BytesStart<'_>) -> Result<(), PluginError> {
+    for (index, attribute) in element.attributes().enumerate() {
+        if index >= MAX_ATTRIBUTES_PER_ELEMENT {
+            return Err(PluginError::LimitExceeded {
+                resource: "attributes per element",
+                limit: MAX_ATTRIBUTES_PER_ELEMENT,
+            });
+        }
+        attribute?;
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct ParseState {
     in_file: bool,
     current_file: Option<FileBuilder>,
     text_target: Option<TextTarget>,
+    text_buffer: String,
+    element_text_bytes: Vec<usize>,
+    outside_text_bytes: usize,
     current_hash_algo: Option<ChecksumAlgo>,
     files: Vec<ContainerLink>,
 }
@@ -84,7 +151,8 @@ struct FileBuilder {
 }
 
 impl ParseState {
-    fn on_start(&mut self, e: quick_xml::events::BytesStart<'_>) -> Result<(), PluginError> {
+    fn on_start(&mut self, e: BytesStart<'_>) -> Result<(), PluginError> {
+        self.element_text_bytes.push(0);
         let local = local_name(e.name().as_ref());
         match local.as_str() {
             "file" => {
@@ -93,30 +161,60 @@ impl ParseState {
                 for attr in e.attributes() {
                     let attr = attr?;
                     if local_name(attr.key.as_ref()) == "name" {
-                        builder.name = Some(attr.unescape_value()?.into_owned());
+                        builder.name =
+                            Some(attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned());
                     }
                 }
                 self.current_file = Some(builder);
             }
-            "size" if self.in_file => self.text_target = Some(TextTarget::Size),
-            "url" if self.in_file => self.text_target = Some(TextTarget::Url),
+            "size" if self.in_file => self.start_text(TextTarget::Size),
+            "url" if self.in_file => self.start_text(TextTarget::Url),
             "hash" if self.in_file => {
                 self.current_hash_algo = parse_hash_attr(&e)?;
-                self.text_target = Some(TextTarget::Hash);
+                self.start_text(TextTarget::Hash);
             }
             _ => {}
         }
         Ok(())
     }
 
-    fn on_text(&mut self, text: String) {
+    fn start_text(&mut self, target: TextTarget) {
+        self.text_target = Some(target);
+        self.text_buffer.clear();
+    }
+
+    fn append_text(&mut self, text: &str) -> Result<(), PluginError> {
+        let accumulated = self
+            .element_text_bytes
+            .last()
+            .copied()
+            .unwrap_or(self.outside_text_bytes)
+            .saturating_add(text.len());
+        ensure_within_limit(accumulated, MAX_TEXT_BYTES, "text bytes")?;
+        if let Some(element_text_bytes) = self.element_text_bytes.last_mut() {
+            *element_text_bytes = accumulated;
+        } else {
+            self.outside_text_bytes = accumulated;
+        }
+        if self.text_target.is_some() {
+            ensure_within_limit(
+                self.text_buffer.len().saturating_add(text.len()),
+                MAX_TEXT_BYTES,
+                "text bytes",
+            )?;
+            self.text_buffer.push_str(text);
+        }
+        Ok(())
+    }
+
+    fn finish_text(&mut self) {
         let Some(target) = self.text_target else {
             return;
         };
         let Some(builder) = self.current_file.as_mut() else {
             return;
         };
-        let trimmed = text.trim();
+        let trimmed = self.text_buffer.trim();
         if trimmed.is_empty() {
             return;
         }
@@ -139,6 +237,7 @@ impl ParseState {
     }
 
     fn on_end(&mut self, name: &[u8]) -> Result<(), PluginError> {
+        self.element_text_bytes.pop();
         let local = local_name(name);
         match local.as_str() {
             "file" => {
@@ -149,7 +248,9 @@ impl ParseState {
                 }
             }
             "size" | "url" | "hash" => {
+                self.finish_text();
                 self.text_target = None;
+                self.text_buffer.clear();
                 if local == "hash" {
                     self.current_hash_algo = None;
                 }
@@ -174,13 +275,14 @@ fn into_link(b: FileBuilder) -> Result<ContainerLink, PluginError> {
     })
 }
 
-fn parse_hash_attr(
-    e: &quick_xml::events::BytesStart<'_>,
-) -> Result<Option<ChecksumAlgo>, PluginError> {
+fn parse_hash_attr(e: &BytesStart<'_>) -> Result<Option<ChecksumAlgo>, PluginError> {
     for attr in e.attributes() {
         let attr = attr?;
         if local_name(attr.key.as_ref()) == "type" {
-            let raw = attr.unescape_value()?.into_owned().to_lowercase();
+            let raw = attr
+                .normalized_value(XmlVersion::Implicit1_0)?
+                .into_owned()
+                .to_lowercase();
             let normalised = raw.replace('-', "");
             return Ok(match normalised.as_str() {
                 "md5" => Some(ChecksumAlgo::Md5),
@@ -307,5 +409,164 @@ mod tests {
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].filename.as_deref(), Some("a.bin"));
         assert_eq!(links[1].filename.as_deref(), Some("b.bin"));
+    }
+
+    #[test]
+    fn decode_rejects_input_larger_than_one_mebibyte() {
+        let input = vec![b' '; 1024 * 1024 + 1];
+
+        let err = decode(&input).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PluginError::LimitExceeded {
+                resource: "input bytes",
+                limit: 1_048_576
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_excessive_element_depth() {
+        let mut xml = String::from("<metalink>");
+        for _ in 0..64 {
+            xml.push_str("<nested>");
+        }
+        xml.push_str("<file><url>https://example.com/file.bin</url></file>");
+        for _ in 0..64 {
+            xml.push_str("</nested>");
+        }
+        xml.push_str("</metalink>");
+
+        let err = decode(xml.as_bytes()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PluginError::LimitExceeded {
+                resource: "XML depth",
+                limit: 64
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_excessive_element_count() {
+        let mut xml = String::from("<metalink>");
+        for _ in 0..50_000 {
+            xml.push_str("<x/>");
+        }
+        xml.push_str("<file><url>https://example.com/file.bin</url></file></metalink>");
+
+        let err = decode(xml.as_bytes()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PluginError::LimitExceeded {
+                resource: "XML elements",
+                limit: 50_000
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_excessive_attributes() {
+        let mut xml = String::from("<metalink");
+        for index in 0..65 {
+            xml.push_str(&format!(" a{index}=\"x\""));
+        }
+        xml.push_str("><file><url>https://example.com/file.bin</url></file></metalink>");
+
+        let err = decode(xml.as_bytes()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PluginError::LimitExceeded {
+                resource: "attributes per element",
+                limit: 64
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_text_nodes() {
+        let url = "a".repeat(64 * 1024 + 1);
+        let xml = format!("<metalink><file><url>{url}</url></file></metalink>");
+
+        let err = decode(xml.as_bytes()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PluginError::LimitExceeded {
+                resource: "text bytes",
+                limit: 65_536
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_text_in_unrecognized_element() {
+        let ignored = "a".repeat(MAX_TEXT_BYTES + 1);
+        let xml = format!(
+            "<metalink><ignored>{ignored}</ignored><file><url>https://example.com/file.bin</url></file></metalink>"
+        );
+
+        let err = decode(xml.as_bytes()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PluginError::LimitExceeded {
+                resource: "text bytes",
+                limit: 65_536
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_text_split_across_references() {
+        let references = "&amp;".repeat(MAX_TEXT_BYTES + 1);
+        let xml = format!("<metalink><file><url>{references}</url></file></metalink>");
+
+        let err = decode(xml.as_bytes()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PluginError::LimitExceeded {
+                resource: "text bytes",
+                limit: 65_536
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_ignored_text_split_across_references() {
+        let references = "&amp;".repeat(MAX_TEXT_BYTES + 1);
+        let xml = format!(
+            "<metalink><ignored>{references}</ignored><file><url>https://example.com/file.bin</url></file></metalink>"
+        );
+
+        let err = decode(xml.as_bytes()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PluginError::LimitExceeded {
+                resource: "text bytes",
+                limit: 65_536
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_reports_malformed_xml_as_typed_error() {
+        let err = decode(b"<metalink><file></metalink>").unwrap_err();
+
+        assert!(matches!(err, PluginError::Xml(_)));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_document_after_complete_file() {
+        let err =
+            decode(b"<metalink><file><url>https://example.com/file.bin</url></file>").unwrap_err();
+
+        assert!(matches!(err, PluginError::Xml(_)));
     }
 }
